@@ -3,6 +3,8 @@
 Playwright MCP browser validation for Claude Code: an agent brief, two skills, and a CLI that turns
 the recordings into one narrated evidence video.
 
+Demo Video: https://youtu.be/-8JNMW7W0Es
+
 | Path                                         | What it is                                                                   |
 | -------------------------------------------- | ---------------------------------------------------------------------------- |
 | `AGENTS.md` (imported by `CLAUDE.md`)        | The browser-tester brief: validation rules, macro discipline, video evidence |
