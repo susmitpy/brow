@@ -1,0 +1,1127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Follow the script's own symlink chain first: the README suggests linking
+# brow/brow onto PATH, and `pwd -P` only resolves linked directories, so a
+# linked file would otherwise put BROW_DIR (and lib/) beside the link.
+# Portable loop rather than `readlink -f`, which older macOS lacks.
+brow_source="${BASH_SOURCE[0]}"
+while [[ -L "$brow_source" ]]; do
+  brow_link_dir="$(cd "$(dirname "$brow_source")" && pwd -P)"
+  brow_source="$(readlink "$brow_source")"
+  [[ "$brow_source" == /* ]] || brow_source="$brow_link_dir/$brow_source"
+done
+BROW_DIR="$(cd "$(dirname "$brow_source")" && pwd -P)"
+unset brow_source brow_link_dir
+# Where recordings live, relative to the project root (the Git toplevel of the
+# current directory, or the current directory outside Git). Git-ignore it:
+# recordings capture the login screen, so they are local evidence only.
+VIDEO_ROOT="${BROW_VIDEO_ROOT:-brow/videos}"
+# Browser-video post-processing (`brow video-note`, `brow merge-videos`). Playwright
+# only ever writes VP8 in a webm container, which does not play in QuickTime,
+# Preview or Quick Look on macOS, so a reviewer on a Mac gets nothing without a
+# transcode. H.264 in mp4 is the one container that plays natively on both this
+# host and macOS. BROW_VIDEO_FFMPEG points at the encoder when it is not on PATH.
+VIDEO_FFMPEG="${BROW_VIDEO_FFMPEG:-}"
+# Thresholds are raised off ffmpeg's defaults, which keep far too much. The
+# source is lossy VP8, so two frames of an unchanged screen are never
+# bit-identical and an exact-match threshold would drop nothing at all -- but
+# the default hi=768 goes too far the other way: it holds a frame whenever any
+# single 8x8 block moves, and a blinking text caret is exactly that. A focused
+# input therefore defeats the decimator completely and a still page records as
+# motion.
+#
+# Measured on a 12s 1280x720 synthetic, 300 frames in, only a 2x18 caret
+# blinking at 1Hz: hi=768 keeps 24 frames (one per blink), hi>=3840 keeps 1.
+# The evidence has to survive that, so the same sweep ran against a permanent
+# 10x14 digit change and an 18x18 checkbox tick -- the smallest real state
+# changes these recordings have to prove. Both keep both frames at every hi up
+# to 12800, so 5120 sits with margin on either side. On real validation
+# recordings it drops a further ~5% of frames, which is the cursor churn and
+# not content.
+#
+# frac is lowered from ffmpeg's 0.33 for the opposite reason: at the default it
+# effectively never fires, so a broad low-contrast change (a panel fading in)
+# had to clear hi block-by-block to survive. At 0.01 it survives on breadth.
+VIDEO_DEDUPE_FILTER="${BROW_VIDEO_DEDUPE_FILTER:-mpdecimate=hi=5120:lo=320:frac=0.01}"
+# Longest gap a surviving frame may keep, in seconds. Dropping every duplicate
+# and re-packing at one frame time collapses a 30 s idle wait to 40 ms, which
+# also flashes past the chapter cards and the post-click states that are the
+# actual evidence; clamping instead keeps a still on screen this long.
+VIDEO_MAX_HOLD_SECONDS="${BROW_VIDEO_MAX_HOLD_SECONDS:-0.5}"
+# The clamp above is per gap, which is not the same as bounding what a still
+# screen costs the reviewer. Whatever the decimator lets through gets its own
+# VIDEO_MAX_HOLD_SECONDS, so a page that keeps producing near-identical frames
+# -- a blinking caret the thresholds do not quite catch, or the broad VP8
+# re-encode shimmer that `frac` is deliberately sensitive to -- replays as a run
+# of half-second stills rather than one. Measured on real recordings: a still
+# page at the end of a flow kept a frame roughly twice a second and replayed as
+# 6.5 s of nothing happening.
+#
+# So the holds are also budgeted. Consecutive stills draw from one pool; once a
+# stretch of screen has been up for VIDEO_IDLE_BUDGET_SECONDS, the rest of that
+# stretch is held for VIDEO_IDLE_HOLD_SECONDS a frame instead. The pool refills
+# on real motion, so this only ever compresses time the screen was not changing.
+VIDEO_IDLE_BUDGET_SECONDS="${BROW_VIDEO_IDLE_BUDGET_SECONDS:-1.0}"
+# Hold for stills past the budget. Must stay at or above one frame time at
+# VIDEO_MERGE_FPS (40 ms): below that the merge, which re-times to a constant
+# rate, would collapse distinct frames onto the same output frame -- and it is
+# also the floor at which a change is still visible rather than a flicker.
+VIDEO_IDLE_HOLD_SECONDS="${BROW_VIDEO_IDLE_HOLD_SECONDS:-0.06}"
+# Gap below which a surviving frame counts as motion playing rather than a
+# still: two frame times at the 25 fps browser-tester records.
+VIDEO_IDLE_MOTION_GAP_SECONDS="${BROW_VIDEO_IDLE_MOTION_GAP_SECONDS:-0.2}"
+# The merge re-scales every part to one geometry: the concat filter refuses
+# inputs that disagree, and browser-tester records 1280x720.
+VIDEO_MERGE_SIZE="${BROW_VIDEO_MERGE_SIZE:-1280x720}"
+VIDEO_MERGE_FPS="${BROW_VIDEO_MERGE_FPS:-25}"
+
+# Narration (`brow narrate-video`). On by default: the merged video is what the
+# reviewer actually watches, and a silent one makes them infer intent from
+# mouse movement. It costs a model call and a speech synthesiser -- minutes of
+# work -- so prune runs it in a subshell, and a narration failure still leaves
+# the silent merged video intact.
+# BROW_NARRATION_ENABLED=0 (or BROW_VIDEO_SKIP_NARRATE=1) turns it back off.
+NARRATION_ENABLED="${BROW_NARRATION_ENABLED:-1}"
+# Words per second the script is budgeted at. Piper's en_US-lessac voices
+# measured 3.2 w/s on real narration sentences; 2.6 leaves room for the pause
+# baked onto the end of every beat, and under-running only costs a little
+# silence where over-running costs a visible freeze.
+NARRATION_WORDS_PER_SECOND="${BROW_NARRATION_WORDS_PER_SECOND:-2.6}"
+# Longest a segment may freeze on its last frame while the voice catches up.
+# This, not the word budget, is what actually bounds the damage from an
+# over-verbose script: beats are dropped until the pad fits.
+NARRATION_MAX_PAD_SECONDS="${BROW_NARRATION_MAX_PAD_SECONDS:-20}"
+# Other knobs, all read directly by brow/lib/narrate:
+#   BROW_NARRATION_TTS            piper (default) | command | none
+#   BROW_NARRATION_VOICE          piper voice name, default en_US-lessac-medium
+#   BROW_NARRATION_VOICE_MODEL    an .onnx to use instead of the cached download
+#   BROW_NARRATION_ESPEAK_DATA    espeak-ng data dir, if the probed ones are wrong
+#   BROW_NARRATION_TTS_COMMAND    command line for BROW_NARRATION_TTS=command
+#   BROW_NARRATION_CAPTIONS      off (default) | burn | softsub
+#   BROW_NARRATION_MODEL          script-writing model, default sonnet
+#   BROW_NARRATION_GENERATOR      set to `deterministic` to skip the model
+#   BROW_NARRATION_CLAUDE_HOME    CLAUDE_CONFIG_DIR for the script call
+#   BROW_NARRATION_CLAUDE_BIN     claude CLI to call, default `claude`
+#   BROW_NARRATION_TRANSCRIPTS    dir of Claude Code session transcripts (.jsonl)
+#                                 to read chapter titles from, default this
+#                                 project's ~/.claude/projects/<slug>
+#   BROW_VIDEO_SKIP_NARRATE=1     hard off, mirrors BROW_VIDEO_SKIP_MERGE
+
+die() {
+  printf 'brow: %s\n' "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+# The project the recordings belong to: the Git toplevel when there is one, so
+# every subdirectory of a checkout agrees on one video tree, else the cwd.
+project_root() {
+  local root=""
+  if command -v git >/dev/null 2>&1; then
+    root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
+  fi
+  [[ -n "$root" ]] || root="$PWD"
+  (cd "$root" && pwd -P)
+}
+
+# Absolute path to an ffmpeg that can actually post-process a recording, or a
+# non-zero exit. Playwright's bundled build is not one: it is configured
+# --disable-everything with libvpx and the webm muxer only, so it has neither
+# mpdecimate nor libx264 and fails on the filter graph rather than at startup.
+# Probed once per run, and never through a pipe -- `ffmpeg | grep -q` exits
+# ffmpeg with SIGPIPE, which pipefail then reports as a failed probe.
+#
+# BROW_VIDEO_FFMPEG, when set, is the only candidate. Otherwise Homebrew's
+# keg-only ffmpeg-full is tried before PATH: the stock `ffmpeg` formula has no
+# libass, so it can dedupe and merge but not burn captions.
+video_ffmpeg_probed=""
+video_ffmpeg_resolved=""
+video_ffmpeg() {
+  local name candidate filters encoders
+  local -a candidates
+  if [[ -z "$video_ffmpeg_probed" ]]; then
+    video_ffmpeg_probed=1
+    if [[ -n "$VIDEO_FFMPEG" ]]; then
+      candidates=("$VIDEO_FFMPEG")
+    else
+      candidates=(/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg /usr/local/opt/ffmpeg-full/bin/ffmpeg ffmpeg)
+    fi
+    for name in "${candidates[@]}"; do
+      candidate="$(command -v "$name" 2>/dev/null || true)"
+      [[ -n "$candidate" ]] || continue
+      filters="$("$candidate" -hide_banner -filters 2>/dev/null || true)"
+      encoders="$("$candidate" -hide_banner -encoders 2>/dev/null || true)"
+      if [[ "$filters" == *" mpdecimate "* ]] && [[ "$encoders" == *" libx264 "* ]]; then
+        video_ffmpeg_resolved="$candidate"
+        break
+      fi
+    done
+  fi
+  [[ -n "$video_ffmpeg_resolved" ]] || return 1
+  printf '%s\n' "$video_ffmpeg_resolved"
+}
+
+# ffprobe is only needed for the merged file's chapter marks, so it is resolved
+# separately and its absence is not fatal.
+video_ffprobe() {
+  local ffmpeg_bin candidate
+  if ffmpeg_bin="$(video_ffmpeg)"; then
+    candidate="$(dirname "$ffmpeg_bin")/ffprobe"
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+  command -v ffprobe 2>/dev/null
+}
+
+# Whether this ffmpeg can burn captions into the picture, and how.
+#
+# Probed separately from video_ffmpeg because it is not fatal: a build without
+# libass still produces the voice-over, which is the more valuable half, and the
+# .ass sidecar survives for a host that can burn it later. Homebrew's stock
+# ffmpeg formula has no libass -- `brew install ffmpeg-full`, which
+# video_ffmpeg finds without it being on PATH. Distro and common static Linux
+# builds already have it.
+video_caption_mode_probed=""
+video_caption_mode_resolved=""
+video_caption_mode() {
+  local bin filters
+  if [[ -z "$video_caption_mode_probed" ]]; then
+    video_caption_mode_probed=1
+    video_caption_mode_resolved=softsub
+    if bin="$(video_ffmpeg)"; then
+      # Not through a pipe: `ffmpeg | grep -q` SIGPIPEs once grep exits, and
+      # under pipefail that reports a false negative -- the same trap
+      # video_ffmpeg documents.
+      filters="$("$bin" -hide_banner -filters 2>/dev/null || true)"
+      if [[ "$filters" == *" subtitles "* ]]; then
+        video_caption_mode_resolved=ass
+      fi
+    fi
+  fi
+  printf '%s\n' "$video_caption_mode_resolved"
+}
+
+video_caption_hint() {
+  printf 'this ffmpeg has no subtitles filter (libass), so captions were muxed as a soft subtitle track instead of burned in. Most players hide those unless subtitles are switched on. Install an ffmpeg built --enable-libass (macOS: brew install ffmpeg-full) or point BROW_VIDEO_FFMPEG at one, then re-run: brow narrate-video %s --force' "$1"
+}
+
+video_ffmpeg_hint() {
+  printf 'no post-processing ffmpeg found (tried %s; see dev-env/install-tools.md). Playwright'"'"'s bundled build cannot do this: it has no mpdecimate and no libx264. Install a full ffmpeg on PATH or point BROW_VIDEO_FFMPEG at one.' "${VIDEO_FFMPEG:-ffmpeg-full, ffmpeg}"
+}
+
+# True when the file carries an audio stream. Narration is the only thing on
+# this box that puts one on a recording, and narration hard-requires ffprobe --
+# so "no ffprobe" and "no audio to lose" are the same state, and answering false
+# there is safe rather than merely convenient.
+video_has_audio() {
+  local file="$1" ffprobe_bin streams
+  [[ -s "$file" ]] || return 1
+  ffprobe_bin="$(video_ffprobe 2>/dev/null || true)"
+  [[ -n "$ffprobe_bin" ]] || return 1
+  streams="$("$ffprobe_bin" -v error -select_streams a -show_entries stream=index \
+    -of csv=p=0 "$file" 2>/dev/null)" || return 1
+  [[ -n "$streams" ]]
+}
+
+# Drops still frames from one recording and rewrites it as H.264/mp4, setting
+# VIDEO_DEDUPE_PATH to what it produced. The source is removed only after the
+# replacement is known good: a recording is the only evidence a validation run
+# happened, so a half-written transcode must never be what is left behind.
+video_dedupe() {
+  local source="$1" ffmpeg_bin target tmp filter
+  VIDEO_DEDUPE_PATH=""
+  VIDEO_DEDUPE_ERROR=""
+  # Decimation is destructive to a voice-over twice over: the encode below drops
+  # audio outright with -an, and the setpts clamp re-times the video against a
+  # soundtrack that would keep its own clock, so even carrying the stream
+  # through would leave narration describing the wrong frames. A recording that
+  # already has audio has been narrated, which means it has already been
+  # deduped -- so the right move is to leave it exactly as it is.
+  if video_has_audio "$source"; then
+    VIDEO_DEDUPE_PATH="$source"
+    return 0
+  fi
+  ffmpeg_bin="$(video_ffmpeg)" || {
+    VIDEO_DEDUPE_ERROR="$(video_ffmpeg_hint)"
+    return 1
+  }
+  target="${source%.*}.mp4"
+  tmp="$target.partial.mp4"
+  rm -f "$tmp"
+  # setpts clamps the gap to the previous kept frame instead of re-packing at a
+  # fixed rate, so real motion still plays at its recorded speed while a run of
+  # dropped stills collapses to VIDEO_MAX_HOLD_SECONDS. PREV_* are NAN on the
+  # first frame, which would otherwise poison every timestamp after it.
+  #
+  # st()/ld() carry state across frames, which is what makes the budget
+  # possible: the expression is evaluated once per frame in order, so slots
+  # hold the previous frame's values. In order --
+  #   1 gap to the previous surviving frame
+  #   2 whether that gap is short enough to be motion playing
+  #   3 how many motion frames in a row (one alone is not a burst: a still page
+  #     that keeps a frame per caret blink also keeps the odd adjacent frame,
+  #     and treating that as motion would refill the budget every blink)
+  #   4 on-screen time this still stretch has spent, reset by a motion burst
+  #     and by nothing else. A gap-based reset used to sit here too, on the
+  #     theory that a frame surviving a long gap is a discrete state change
+  #     owed a full hold. Measured on a real preview-page recording it did
+  #     the opposite: a still page drips one surviving frame every couple of
+  #     seconds, so every survivor cleared the 1.5 s threshold, refilled the
+  #     pool, and took a full VIDEO_MAX_HOLD_SECONDS. 16 s of that stretch
+  #     alternated 0.04 s / 0.50 s gaps -- 28 half-second holds in a row, the
+  #     budget never once reaching the 1.0 s that would have collapsed them,
+  #     and ~12 s of the merged video showing a page doing nothing. Only real
+  #     motion refills the pool now; a click result after a frozen page still
+  #     gets its full hold, because motion is what follows it
+  #   5 this frame's hold, never longer than the gap actually recorded
+  #
+  # The single quotes are ffmpeg's, not the shell's, and are load-bearing: a
+  # comma separates filters in a graph and a semicolon separates chains, so an
+  # unquoted expression argument is read as `setpts=st(1` followed by a filter
+  # named `if(isnan(PREV_INPTS)`.
+  local hold_expr
+  hold_expr="st(1,if(isnan(PREV_INPTS),0,PTS-PREV_INPTS));"
+  hold_expr+="st(2,lt(ld(1),$VIDEO_IDLE_MOTION_GAP_SECONDS/TB));"
+  hold_expr+="st(3,if(ld(2),ld(3)+1,0));"
+  hold_expr+="st(4,if(gte(ld(3),2),0,ld(4)));"
+  hold_expr+="st(5,min(ld(1),if(gt(ld(4),$VIDEO_IDLE_BUDGET_SECONDS/TB),$VIDEO_IDLE_HOLD_SECONDS/TB,$VIDEO_MAX_HOLD_SECONDS/TB)));"
+  hold_expr+="st(4,ld(4)+ld(5));"
+  hold_expr+="if(isnan(PREV_OUTPTS),0,PREV_OUTPTS+ld(5))"
+  filter="$VIDEO_DEDUPE_FILTER,setpts='$hold_expr'"
+  if ! VIDEO_DEDUPE_ERROR="$("$ffmpeg_bin" -hide_banner -loglevel error -nostdin -y \
+    -i "$source" -an -vf "$filter" -fps_mode vfr -c:v libx264 -preset veryfast \
+    -crf 24 -pix_fmt yuv420p -movflags +faststart "$tmp" 2>&1 >/dev/null)"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [[ ! -s "$tmp" ]]; then
+    VIDEO_DEDUPE_ERROR='ffmpeg reported success but wrote nothing'
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$target"
+  [[ "$target" == "$source" ]] || rm -f "$source"
+  VIDEO_DEDUPE_PATH="$target"
+}
+
+# Shared guard for the video commands: <project root>/<VIDEO_ROOT>/<ticketId>.
+# An absolute BROW_VIDEO_ROOT is used as is.
+video_ticket_dir() {
+  local ticket_id="$1" base
+  [[ -n "$ticket_id" ]] || die "missing ticket ID"
+  [[ "$ticket_id" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "invalid ticket ID: $ticket_id"
+  case "$VIDEO_ROOT" in
+    /*) base="$VIDEO_ROOT" ;;
+    *) base="$(project_root)/$VIDEO_ROOT" ;;
+  esac
+  printf '%s/%s\n' "$base" "$ticket_id"
+}
+
+# Playwright MCP resolves browser_start_video's `filename` with path.resolve()
+# and never creates the parent directory, so the recording target has to exist
+# before the tool is called. Printing the absolute path also keeps the agent
+# from having to assemble it from the ticket ID by hand.
+cmd_video_dir() {
+  local ticket_id="${1:-}" ticket_dir
+  [[ -n "$ticket_id" ]] || die "usage: brow video-dir <ticketId>"
+  ticket_dir="$(video_ticket_dir "$ticket_id")"
+  mkdir -p "$ticket_dir/raw"
+  printf '%s/raw\n' "$ticket_dir"
+}
+
+# Appends one recording to the ticket's video manifest. This exists as a command
+# rather than a "hand-write this JSON" prompt rule because the manifest is the
+# sole input to the keep/delete decision -- a malformed merge would silently
+# take real evidence with it.
+cmd_video_note() {
+  local ticket_id="${1:-}" ticket_dir root
+  [[ -n "$ticket_id" ]] || die "usage: brow video-note <ticketId> --file <path> --flow <text> --verdict pass|fail [--variant <text>] [--url <url>]"
+  shift
+
+  local file="" flow="" verdict="" variant="" url=""
+  while (($# > 0)); do
+    case "$1" in
+      --file) file="${2:-}"; shift 2 ;;
+      --flow) flow="${2:-}"; shift 2 ;;
+      --verdict) verdict="${2:-}"; shift 2 ;;
+      --variant) variant="${2:-}"; shift 2 ;;
+      --url) url="${2:-}"; shift 2 ;;
+      *) die "unknown video-note option: $1" ;;
+    esac
+  done
+
+  [[ -n "$file" ]] || die "video-note requires --file"
+  [[ -n "$flow" ]] || die "video-note requires --flow"
+  case "$verdict" in
+    pass | fail) ;;
+    *) die "video-note requires --verdict pass|fail (got: ${verdict:-none})" ;;
+  esac
+
+  ticket_dir="$(video_ticket_dir "$ticket_id")"
+  root="$(project_root)"
+
+  # Resolved out here so the node step below can report the toolchain as missing
+  # in one line instead of shelling out to look for it.
+  local ffmpeg_bin=""
+  ffmpeg_bin="$(video_ffmpeg)" || ffmpeg_bin=""
+
+  BROW_VIDEO_DIR="$ticket_dir" BROW_TICKET_ID="$ticket_id" BROW_FILE="$file" BROW_FLOW="$flow" \
+    BROW_VERDICT="$verdict" BROW_VARIANT="$variant" BROW_URL="$url" \
+    BROW_PROJECT_ROOT="$root" BROW_BIN="$BROW_DIR/brow" \
+    BROW_FFMPEG="$ffmpeg_bin" BROW_FFMPEG_HINT="$(video_ffmpeg_hint)" node --input-type=module <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+
+const ticketDir = process.env.BROW_VIDEO_DIR;
+const projectRoot = process.env.BROW_PROJECT_ROOT;
+const manifestPath = path.join(ticketDir, 'manifest.json');
+
+// These run inside a heredoc, so an uncaught throw would spill a Node stack
+// trace at the agent instead of the one line it can act on.
+function die(message) {
+  process.stderr.write(`brow: ${message}\n`);
+  process.exit(1);
+}
+
+// Accept whatever shape the agent has in hand and store one canonical form.
+// Resolving against the ticket dir alone was not enough: a project-relative
+// path (brow/videos/<id>/raw/x.webm) resolved to <ticketDir>/brow/...
+// and a bare filename to <ticketDir>/x.webm, so both were rejected even though
+// the recording was sitting in raw/. Try every shape and let the one that
+// actually exists win -- guessing a shape the agent did not mean is how a
+// manifest ends up pointing at some other run's recording.
+function toTicketRelative(input) {
+  const shapes = [
+    path.resolve(ticketDir, input),
+    ...(projectRoot ? [path.resolve(projectRoot, input)] : []),
+    path.join(ticketDir, 'raw', path.basename(input)),
+    path.join(ticketDir, 'keep', path.basename(input)),
+  ];
+  // Each shape is also tried as its post-processed .mp4 sibling. Noting a run
+  // replaces the recording with one, so the .webm path the agent recorded
+  // to no longer exists by the time it re-notes that run -- and re-noting is
+  // the normal way a fail becomes a pass after re-validation. Without this the
+  // correction dies as "recording not found" on evidence that is right there.
+  const candidates = [];
+  for (const shape of shapes) {
+    candidates.push(shape);
+    const extension = path.extname(shape);
+    if (extension && extension.toLowerCase() !== '.mp4') {
+      candidates.push(`${shape.slice(0, -extension.length)}.mp4`);
+    }
+  }
+  for (const absolute of candidates) {
+    const relative = path.relative(ticketDir, absolute);
+    // Anything resolving outside the ticket dir is not this ticket's evidence.
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      continue;
+    }
+    if (fs.existsSync(absolute)) {
+      return relative;
+    }
+  }
+  // A recording we cannot find is the failure mode this whole feature exists
+  // to catch: the agent reported a run it never actually recorded.
+  die(`recording not found for ${input} under ${ticketDir} (looked in raw/ and keep/)`);
+}
+
+let file = toTicketRelative(process.env.BROW_FILE);
+
+// Playwright writes the container on browser_stop_video, so a zero-byte file
+// means the recording never landed -- browser_stop_video said "No videos were
+// recorded", or ffmpeg was missing. Noting it anyway would put a file in the
+// manifest that claims to be evidence and plays back as nothing, and the
+// merge would then splice it into the video a reviewer watches.
+if (fs.statSync(path.join(ticketDir, file)).size === 0) {
+  die(
+    `recording is empty (0 bytes): ${path.join(ticketDir, file)}\n` +
+      '    browser_stop_video did not write a video. Check that it reported a file, ' +
+      'and that Playwright ffmpeg is installed (npx playwright install ffmpeg).',
+  );
+}
+
+// Post-process on save rather than at prune time: the manifest is what every
+// later step reads, so it has to name the file a reviewer will actually be
+// handed. Dropping the stills here also means the raw VP8 never accumulates.
+//
+// A failure here is deliberately not fatal. The recording itself is intact and
+// is the thing we cannot re-create; refusing to note it would throw away a
+// real validation run over an encoder that is missing on this host. The merge
+// step re-encodes whatever it is given, so a webm left behind still ends up in
+// the merged mp4.
+let postProcessed = false;
+if (process.env.BROW_FFMPEG) {
+  try {
+    const produced = execFileSync(process.env.BROW_BIN, ['video-dedupe', path.join(ticketDir, file)], {
+      encoding: 'utf8',
+    }).trim();
+    if (produced) {
+      file = path.relative(ticketDir, produced);
+      postProcessed = true;
+    }
+  } catch {
+    process.stderr.write(`warning: could not drop still frames from ${file}; noting the raw recording\n`);
+  }
+} else {
+  process.stderr.write(`warning: ${process.env.BROW_FFMPEG_HINT}\n`);
+  process.stderr.write('warning: noting the raw webm unprocessed; still frames were not dropped\n');
+}
+
+let manifest = { ticketId: process.env.BROW_TICKET_ID, recordings: [] };
+if (fs.existsSync(manifestPath)) {
+  manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  if (!Array.isArray(manifest.recordings)) {
+    die(`manifest has no recordings array: ${manifestPath}`);
+  }
+}
+
+const entry = {
+  file,
+  flow: process.env.BROW_FLOW,
+  variant: process.env.BROW_VARIANT || null,
+  url: process.env.BROW_URL || null,
+  verdict: process.env.BROW_VERDICT,
+  recordedAt: new Date().toISOString(),
+  // False means the still frames are still in there and the file is raw webm,
+  // which is worth knowing when the merged output looks longer than expected.
+  postProcessed,
+};
+
+// Re-noting the same recording corrects it rather than double-counting: a
+// verdict often flips from fail to pass only after the re-validation run.
+const existing = manifest.recordings.findIndex((recording) => recording.file === file);
+if (existing >= 0) {
+  manifest.recordings[existing] = entry;
+} else {
+  manifest.recordings.push(entry);
+}
+
+fs.mkdirSync(ticketDir, { recursive: true });
+const tmp = `${manifestPath}.tmp`;
+fs.writeFileSync(tmp, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+fs.renameSync(tmp, manifestPath);
+
+process.stdout.write(`noted ${file} (${entry.verdict}) in ${manifestPath}\n`);
+NODE
+}
+
+# Drops the still frames from one recording and transcodes it to mp4, printing
+# the path it produced. `brow video-note` calls this on every recording it notes;
+# it is a command rather than an inline step so a recording made before this
+# existed, or one noted on a host with no encoder, can be reprocessed by hand.
+cmd_video_dedupe() {
+  local source="${1:-}"
+  [[ -n "$source" ]] || die "usage: brow video-dedupe <path to recording>"
+  [[ -f "$source" ]] || die "no such recording: $source"
+  [[ -s "$source" ]] || die "recording is empty (0 bytes): $source"
+  video_ffmpeg >/dev/null || die "$(video_ffmpeg_hint)"
+  video_dedupe "$source" ||
+    die "could not post-process $source${VIDEO_DEDUPE_ERROR:+: $VIDEO_DEDUPE_ERROR}"
+
+  # Re-point an existing manifest entry at what this produced. Reprocessing a
+  # recording that was already noted otherwise leaves the entry naming a file
+  # that no longer exists, and prune then reports the run as both a missing
+  # entry and an unnoted orphan -- two warnings about one intact recording.
+  BROW_OLD="$source" BROW_NEW="$VIDEO_DEDUPE_PATH" node --input-type=module <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+
+const previous = process.env.BROW_OLD;
+const produced = process.env.BROW_NEW;
+if (previous === produced) {
+  process.exit(0);
+}
+// A recording lives in <ticketDir>/raw/ or <ticketDir>/keep/, so the manifest
+// is two levels up. Anything else is a loose file with no manifest to fix.
+const ticketDir = path.dirname(path.dirname(path.resolve(produced)));
+const manifestPath = path.join(ticketDir, 'manifest.json');
+if (!fs.existsSync(manifestPath)) {
+  process.exit(0);
+}
+
+let manifest;
+try {
+  manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+} catch {
+  process.stderr.write(`warning: could not read ${manifestPath}; its entry still names the old file\n`);
+  process.exit(0);
+}
+if (!Array.isArray(manifest.recordings)) {
+  process.exit(0);
+}
+
+const was = path.relative(ticketDir, path.resolve(previous));
+const now = path.relative(ticketDir, path.resolve(produced));
+const entry = manifest.recordings.find((recording) => recording.file === was);
+if (!entry) {
+  process.exit(0);
+}
+entry.file = now;
+entry.postProcessed = true;
+const tmp = `${manifestPath}.tmp`;
+fs.writeFileSync(tmp, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+fs.renameSync(tmp, manifestPath);
+process.stderr.write(`re-pointed ${was} to ${now} in ${manifestPath}\n`);
+NODE
+
+  printf '%s\n' "$VIDEO_DEDUPE_PATH"
+}
+
+# Decides which recordings survive. Keeps passing runs and any failure that
+# was never re-run green; drops a failed run once a later recording of the same
+# flow and variant passed, because the green re-run already proves the outcome.
+cmd_prune_videos() {
+  local ticket_id="${1:-}" ticket_dir
+  [[ -n "$ticket_id" ]] || die "usage: brow prune-videos <ticketId>"
+  ticket_dir="$(video_ticket_dir "$ticket_id")"
+
+  # Bail only when there is genuinely nothing here. A missing manifest with
+  # recordings still in raw/ is the exact case the orphan sweep exists for --
+  # the agent recorded and never noted anything -- and those recordings are
+  # still evidence.
+  if [[ ! -f "$ticket_dir/manifest.json" ]] && [[ -z "$(ls -A "$ticket_dir/raw" 2>/dev/null)" ]]; then
+    printf 'no video manifest for %s (%s) - nothing to prune\n' "$ticket_id" "$ticket_dir"
+    return 0
+  fi
+
+  BROW_VIDEO_DIR="$ticket_dir" BROW_TICKET_ID="$ticket_id" \
+    node --input-type=module <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+
+const ticketDir = process.env.BROW_VIDEO_DIR;
+const ticketId = process.env.BROW_TICKET_ID;
+const manifestPath = path.join(ticketDir, 'manifest.json');
+
+function die(message) {
+  process.stderr.write(`brow: ${message}\n`);
+  process.exit(1);
+}
+
+// No manifest at all means nothing was ever noted; the orphan sweep below then
+// keeps whatever is sitting in raw/.
+const manifest = fs.existsSync(manifestPath)
+  ? JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+  : { ticketId, recordings: [] };
+if (!Array.isArray(manifest.recordings)) {
+  die(`manifest has no recordings array: ${manifestPath}`);
+}
+
+// A zero-byte file is not evidence of anything: browser_stop_video never wrote
+// the container. `brow video-note` rejects these at the gate, but an orphan or a
+// recording emptied after noting can still reach here, and keeping one would
+// export a video that plays back as nothing.
+function isEmpty(absolute) {
+  try {
+    return fs.statSync(absolute).size === 0;
+  } catch {
+    return false;
+  }
+}
+
+// A flow is identified by its --flow and --variant text, so re-recording a
+// flow under the same wording is what marks the earlier failure as superseded.
+const flowKey = (recording) => JSON.stringify([recording.flow ?? null, recording.variant ?? null]);
+
+// Latest passing run per flow key.
+const lastPass = new Map();
+for (const recording of manifest.recordings) {
+  if (recording.verdict === 'pass' && recording.flow) {
+    const at = recording.recordedAt ?? '';
+    const key = flowKey(recording);
+    if (!lastPass.has(key) || lastPass.get(key) < at) {
+      lastPass.set(key, at);
+    }
+  }
+}
+
+function decide(recording) {
+  if (recording.verdict === 'pass') {
+    return { kept: true, reason: 'pass' };
+  }
+  if (recording.verdict === 'orphan') {
+    return { kept: true, reason: 'orphan-no-manifest-entry' };
+  }
+  // Anything not explicitly failed is treated as unknown, and unknown keeps.
+  if (recording.verdict !== 'fail') {
+    return { kept: true, reason: `unknown-verdict:${recording.verdict ?? 'none'}` };
+  }
+  // Only a pass recorded after this failure proves it was fixed. A pass from
+  // before it is the state the failure regressed from, not a re-validation.
+  const passedAt = recording.flow ? lastPass.get(flowKey(recording)) : undefined;
+  if (passedAt !== undefined && recording.recordedAt && passedAt > recording.recordedAt) {
+    return { kept: false, reason: 'superseded' };
+  }
+  return { kept: true, reason: 'fail-not-rerun' };
+}
+
+// A recording may sit in raw/ (fresh) or keep/ (already pruned once); resolving
+// both is what makes a second run a no-op instead of a data-loss event.
+function locate(file) {
+  const candidates = [file, file.replace(/^raw\//, 'keep/')];
+  for (const candidate of candidates) {
+    const absolute = path.join(ticketDir, candidate);
+    if (fs.existsSync(absolute)) {
+      return { relative: candidate, absolute };
+    }
+  }
+  return null;
+}
+
+const keepDir = path.join(ticketDir, 'keep');
+fs.mkdirSync(keepDir, { recursive: true });
+
+const noted = new Set();
+const empties = [];
+let kept = 0;
+let deleted = 0;
+let missing = 0;
+
+for (const recording of manifest.recordings) {
+  const found = locate(recording.file);
+
+  // Deletion is terminal, so the decision that caused it has to be too.
+  // Re-deciding a gone file would let a later readiness or Status change
+  // relabel it -- reporting "file missing" for evidence this command itself
+  // removed on purpose. Freeze the original verdict instead.
+  if (!found && recording.kept === false) {
+    continue;
+  }
+  if (!found) {
+    const decision = decide(recording);
+    recording.kept = decision.kept;
+    recording.keptReason = `${decision.reason} (file missing)`;
+    missing += 1;
+    continue;
+  }
+
+  let decision = decide(recording);
+  if (isEmpty(found.absolute)) {
+    // Noted while it still had bytes, or noted before this guard existed.
+    // Either way it is not evidence, and the operator needs to hear about it.
+    decision = { kept: false, reason: 'empty-recording' };
+    empties.push(path.basename(found.absolute));
+  }
+  recording.kept = decision.kept;
+  recording.keptReason = decision.reason;
+  noted.add(path.basename(found.absolute));
+
+  if (decision.kept) {
+    const destination = path.join(keepDir, path.basename(found.absolute));
+    if (found.absolute !== destination) {
+      fs.renameSync(found.absolute, destination);
+    }
+    recording.file = path.relative(ticketDir, destination);
+    kept += 1;
+  } else {
+    fs.rmSync(found.absolute, { force: true });
+    deleted += 1;
+  }
+}
+
+// A recording with no manifest entry means the agent skipped the note
+// step. Keep it -- an unexplained video is worth more than a deleted one --
+// but say so loudly, because an unnoted recording also means an unreported run.
+const rawDir = path.join(ticketDir, 'raw');
+const orphans = [];
+if (fs.existsSync(rawDir)) {
+  for (const name of fs.readdirSync(rawDir)) {
+    if (noted.has(name)) {
+      continue;
+    }
+    // An empty orphan is neither evidence nor a clue about an unreported run
+    // worth keeping -- it is a recording that failed.
+    if (isEmpty(path.join(rawDir, name))) {
+      fs.rmSync(path.join(rawDir, name), { force: true });
+      empties.push(name);
+      manifest.recordings.push({
+        file: path.join('raw', name),
+        flow: null,
+        variant: null,
+        url: null,
+        verdict: 'orphan',
+        recordedAt: null,
+        kept: false,
+        keptReason: 'empty-recording',
+      });
+      deleted += 1;
+      continue;
+    }
+    fs.renameSync(path.join(rawDir, name), path.join(keepDir, name));
+    orphans.push(name);
+    manifest.recordings.push({
+      file: path.join('keep', name),
+      flow: null,
+      variant: null,
+      url: null,
+      verdict: 'orphan',
+      recordedAt: null,
+      kept: true,
+      keptReason: 'orphan-no-manifest-entry',
+    });
+    kept += 1;
+  }
+}
+
+manifest.prunedAt = new Date().toISOString();
+const tmp = `${manifestPath}.tmp`;
+fs.writeFileSync(tmp, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+fs.renameSync(tmp, manifestPath);
+
+for (const recording of manifest.recordings) {
+  process.stdout.write(`  ${recording.kept ? 'keep  ' : 'delete'} ${recording.file} (${recording.keptReason})\n`);
+}
+if (orphans.length > 0) {
+  process.stderr.write(`warning: ${orphans.length} recording(s) had no manifest entry and were kept: ${orphans.join(', ')}\n`);
+}
+if (empties.length > 0) {
+  process.stderr.write(`warning: ${empties.length} recording(s) were empty (0 bytes) and were deleted: ${empties.join(', ')}\n`);
+}
+if (missing > 0) {
+  process.stderr.write(`warning: ${missing} manifest entr(ies) reference a file that no longer exists\n`);
+}
+process.stdout.write(`pruned videos for ${ticketId}: ${kept} kept, ${deleted} deleted\n`);
+NODE
+
+  # A reviewer wants one file, not a directory of flows. This runs after the
+  # keep/delete decision, never before: retention is per recording, so merging
+  # first would fuse a kept pass and a deleted failure into one inseparable
+  # file. In a subshell because cmd_merge_videos dies on a missing encoder, and
+  # that must not cost the prune its exported recordings.
+  if [[ "${BROW_VIDEO_SKIP_MERGE:-}" != 1 ]]; then
+    (cmd_merge_videos "$ticket_id") ||
+      printf 'warning: merge failed for %s; the individual recordings are still in %s/keep\n' \
+        "$ticket_id" "$ticket_dir" >&2
+  fi
+
+  # Same subshell-and-warn shape as the merge above, and for the same reason:
+  # narration is an improvement to the evidence video, never a precondition for
+  # having one. A failure here must not cost the prune its exported recordings.
+  if [[ "$NARRATION_ENABLED" == 1 && "${BROW_VIDEO_SKIP_NARRATE:-}" != 1 ]]; then
+    (cmd_narrate_video "$ticket_id") ||
+      printf 'warning: narration failed for %s; the silent merged video is intact in %s/keep\n' \
+        "$ticket_id" "$ticket_dir" >&2
+  fi
+}
+
+# Concatenates the kept recordings into the single mp4 the reviewer watches, in
+# the order they were noted, with one chapter mark per flow. The parts stay in
+# keep/ so a second `brow prune-videos` is still a no-op rather than a
+# data-loss event. Nothing here leaves the machine: the merged file is local
+# evidence, watched where it was made.
+cmd_merge_videos() {
+  local ticket_id="" force=0 ticket_dir ffmpeg_bin ffprobe_bin arg
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=1 ;;
+      -*) die "brow merge-videos: unknown option $arg" ;;
+      *) [[ -n "$ticket_id" ]] && die "brow merge-videos: unexpected argument $arg"; ticket_id="$arg" ;;
+    esac
+  done
+  [[ -n "$ticket_id" ]] || die "usage: brow merge-videos <ticketId> [--force]"
+  ticket_dir="$(video_ticket_dir "$ticket_id")"
+  [[ -d "$ticket_dir/keep" ]] || die "nothing to merge for $ticket_id: no $ticket_dir/keep (run brow prune-videos first)"
+  ffmpeg_bin="$(video_ffmpeg)" || die "$(video_ffmpeg_hint)"
+  ffprobe_bin="$(video_ffprobe 2>/dev/null || true)"
+
+  BROW_VIDEO_DIR="$ticket_dir" BROW_TICKET_ID="$ticket_id" BROW_FFMPEG="$ffmpeg_bin" \
+    BROW_FFPROBE="$ffprobe_bin" BROW_MERGE_SIZE="$VIDEO_MERGE_SIZE" BROW_MERGE_FPS="$VIDEO_MERGE_FPS" \
+    BROW_MERGE_FORCE="$force" BROW_LIB="$BROW_DIR/lib" \
+    node --input-type=module <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
+
+// Shared with the narration pass so the two cannot disagree about which
+// recordings make up this ticket's video.
+const { selectParts, titleOf, escapeMetadata, durationOf } = await import(
+  pathToFileURL(path.join(process.env.BROW_LIB, 'video-parts.mjs')).href
+);
+
+const ticketDir = process.env.BROW_VIDEO_DIR;
+const ticketId = process.env.BROW_TICKET_ID;
+const ffmpeg = process.env.BROW_FFMPEG;
+const ffprobe = process.env.BROW_FFPROBE;
+const fps = process.env.BROW_MERGE_FPS;
+const [width, height] = process.env.BROW_MERGE_SIZE.split('x');
+const keepDir = path.join(ticketDir, 'keep');
+const manifestPath = path.join(ticketDir, 'manifest.json');
+const outputName = `${ticketId}.mp4`;
+const output = path.join(keepDir, outputName);
+
+function die(message) {
+  process.stderr.write(`brow: ${message}\n`);
+  process.exit(1);
+}
+
+const manifest = fs.existsSync(manifestPath)
+  ? JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+  : { ticketId, recordings: [] };
+if (!Array.isArray(manifest.recordings)) {
+  die(`manifest has no recordings array: ${manifestPath}`);
+}
+
+const parts = selectParts({ keepDir, manifest, outputName });
+
+if (parts.length === 0) {
+  process.stdout.write(`nothing to merge for ${ticketId}\n`);
+  process.exit(0);
+}
+
+// The merged file is where narration lands: `brow narrate-video` replaces it in
+// place with a voice-over. This encode ends in -an, so re-merging over a
+// narrated video silently returns it to silence -- and when prune runs it
+// unattended nobody is watching the output to notice. Refuse instead. Re-recording
+// after narration means the voice-over is stale anyway, so the way through is
+// --force and a fresh `brow narrate-video`, not a quiet overwrite.
+function hasAudio(file) {
+  if (!ffprobe || !fs.existsSync(file)) return false;
+  try {
+    const out = execFileSync(
+      ffprobe,
+      ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', file],
+      { encoding: 'utf8' },
+    );
+    return out.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+if (hasAudio(output) && process.env.BROW_MERGE_FORCE !== '1') {
+  process.stdout.write(
+    `${outputName} already carries narration audio; leaving it alone. ` +
+      `Re-run with \`brow merge-videos ${ticketId} --force\` to rebuild it silently, ` +
+      `then \`brow narrate-video ${ticketId}\` to put the voice-over back.\n`,
+  );
+  process.exit(0);
+}
+
+// Parts themselves are silent -- Playwright records video only -- so this is a
+// tripwire, not a code path with a fix behind it. Say so rather than dropping
+// the audio without a word.
+const voiced = parts.filter((part) => hasAudio(part.absolute));
+if (voiced.length > 0) {
+  process.stderr.write(
+    `warning: ${voiced.length} part(s) carry audio (${voiced
+      .map((part) => part.name)
+      .join(', ')}); the merge is video-only, so that audio will not be in ${outputName}\n`,
+  );
+}
+
+// Chapter offsets are cumulative input durations, which the concat filter
+// preserves exactly. Without ffprobe the merge still happens, just unchaptered.
+const chapters = [];
+let offset = 0;
+let allKnown = true;
+// Named so the "no chapters" line can say which part could not be measured
+// rather than blaming a missing ffprobe for it. A recording static enough to
+// dedupe down to a single frame has no container duration at all, and one
+// unmeasurable part shifts every mark after it -- so chapters are dropped
+// wholesale rather than silently misplaced.
+let unmeasurable = null;
+for (const part of parts) {
+  const duration = durationOf(ffprobe, part.absolute);
+  if (duration === null) {
+    allKnown = false;
+    unmeasurable = part.name;
+    break;
+  }
+  chapters.push({
+    file: part.name,
+    title: titleOf(part),
+    startMs: Math.round(offset * 1000),
+    endMs: Math.round((offset + duration) * 1000),
+  });
+  offset += duration;
+}
+
+let metadataPath = null;
+if (allKnown && chapters.length > 0) {
+  metadataPath = path.join(ticketDir, '.chapters.ffmetadata');
+  const lines = [';FFMETADATA1'];
+  for (const chapter of chapters) {
+    lines.push('[CHAPTER]', 'TIMEBASE=1/1000', `START=${chapter.startMs}`, `END=${chapter.endMs}`, `title=${escapeMetadata(chapter.title)}`);
+  }
+  fs.writeFileSync(metadataPath, `${lines.join('\n')}\n`, 'utf8');
+}
+
+// Every part is re-scaled and re-timed to one geometry and rate: the concat
+// filter rejects inputs that disagree, and a part left as raw webm (noted on a
+// host with no encoder) can differ in both.
+const chain = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:-1:-1:color=black,setsar=1,fps=${fps}`;
+const graph = `${parts.map((_, index) => `[${index}:v]${chain}[v${index}]`).join(';')};${parts
+  .map((_, index) => `[v${index}]`)
+  .join('')}concat=n=${parts.length}:v=1:a=0[v]`;
+
+const partial = path.join(keepDir, `.${outputName}.partial.mp4`);
+const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y'];
+for (const part of parts) {
+  args.push('-i', part.absolute);
+}
+if (metadataPath) {
+  args.push('-i', metadataPath);
+}
+args.push('-filter_complex', graph, '-map', '[v]');
+if (metadataPath) {
+  args.push('-map_metadata', String(parts.length));
+}
+args.push(
+  '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24',
+  '-pix_fmt', 'yuv420p', '-movflags', '+faststart', partial,
+);
+
+try {
+  execFileSync(ffmpeg, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+} catch (error) {
+  fs.rmSync(partial, { force: true });
+  die(`ffmpeg could not merge ${parts.length} recording(s): ${String(error.stderr || error.message).trim()}`);
+}
+if (!fs.existsSync(partial) || fs.statSync(partial).size === 0) {
+  fs.rmSync(partial, { force: true });
+  die('ffmpeg reported success but wrote no merged file');
+}
+// Renamed into place only once it is known good, so a failed merge leaves the
+// previous merged file rather than a truncated one.
+fs.renameSync(partial, output);
+if (metadataPath) {
+  fs.rmSync(metadataPath, { force: true });
+}
+
+manifest.merged = {
+  file: path.relative(ticketDir, output),
+  parts: parts.map((part) => part.name),
+  chapters: metadataPath ? chapters : [],
+  mergedAt: new Date().toISOString(),
+};
+const tmp = `${manifestPath}.tmp`;
+fs.writeFileSync(tmp, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+fs.renameSync(tmp, manifestPath);
+
+function chapterNote() {
+  if (metadataPath) {
+    return ` (${chapters.length} chapter(s))`;
+  }
+  if (!ffprobe) {
+    return ' (no chapters: ffprobe not found)';
+  }
+  if (unmeasurable) {
+    return ` (no chapters: could not read the duration of ${unmeasurable})`;
+  }
+  return ' (no chapters)';
+}
+
+process.stdout.write(
+  `merged ${parts.length} recording(s) for ${ticketId} into ${output}${chapterNote()}\n`,
+);
+NODE
+}
+
+# Adds a voice-over and burned-in captions to the merged video.
+#
+# Kept out of cmd_merge_videos on purpose: this calls a model and a speech
+# synthesiser, which is minutes of work and a network round trip, and a plain
+# merge should stay fast and offline. It rebuilds the output
+# from the parts in keep/ rather than re-encoding the merged file, because a
+# segment whose narration outruns its footage needs freeze-padding and tpad can
+# only extend the end of a stream -- so the padding has to be upstream of the
+# concat.
+cmd_narrate_video() {
+  local ticket_id="${1:-}" ticket_dir ffmpeg_bin ffprobe_bin caption_mode root
+  [[ -n "$ticket_id" ]] || die "usage: brow narrate-video <ticketId> [--force] [--script-only] [--dry-run] [--captions] [--context <file>]..."
+  shift
+  if [[ "${BROW_VIDEO_SKIP_NARRATE:-}" == 1 ]]; then
+    printf 'narration skipped for %s (BROW_VIDEO_SKIP_NARRATE=1)\n' "$ticket_id"
+    return 0
+  fi
+  ticket_dir="$(video_ticket_dir "$ticket_id")"
+  [[ -d "$ticket_dir/keep" ]] || die "nothing to narrate for $ticket_id: no $ticket_dir/keep (run brow prune-videos first)"
+  ffmpeg_bin="$(video_ffmpeg)" || die "$(video_ffmpeg_hint)"
+  ffprobe_bin="$(video_ffprobe 2>/dev/null || true)"
+  caption_mode="$(video_caption_mode)"
+  root="$(project_root)"
+
+  BROW_VIDEO_DIR="$ticket_dir" BROW_TICKET_ID="$ticket_id" BROW_FFMPEG="$ffmpeg_bin" \
+    BROW_FFPROBE="$ffprobe_bin" BROW_MERGE_SIZE="$VIDEO_MERGE_SIZE" BROW_MERGE_FPS="$VIDEO_MERGE_FPS" \
+    BROW_CAPTION_CAPABILITY="$caption_mode" BROW_LIB="$BROW_DIR/lib" BROW_PROJECT_ROOT="$root" \
+    node "$BROW_DIR/lib/narrate/cli.mjs" "$@"
+}
+
+
+usage() {
+  cat <<'USAGE'
+Usage: brow <command>
+
+Recordings live under <project>/brow/videos/<ticketId>/ (BROW_VIDEO_ROOT),
+where <project> is the Git toplevel of the current directory, else the cwd.
+
+Commands:
+  video-dir <ticketId>
+                   Create and print brow/videos/<ticketId>/raw, the directory
+                   Playwright MCP browser_start_video records into
+  video-note <ticketId> --file <path> --flow <text> --verdict pass|fail
+             [--variant <text>] [--url <url>]
+                   Record one browser validation run in the ticket's video manifest,
+                   dropping its still frames and transcoding it to H.264 mp4 first.
+                   Re-noting the same file replaces its entry
+  video-dedupe <path>
+                   Drop the still frames from one recording and transcode it to mp4,
+                   in place. Run by video-note; useful by hand for a recording noted
+                   on a host that had no encoder at the time
+  prune-videos <ticketId>
+                   Keep passing runs and failures never re-run green; delete a failed
+                   run once a later run of the same --flow/--variant passed. Survivors
+                   move to brow/videos/<ticketId>/keep, then merge-videos and
+                   narrate-video run
+  merge-videos <ticketId> [--force]
+                   Concatenate the kept recordings into the single chaptered mp4 at
+                   brow/videos/<ticketId>/keep/<ticketId>.mp4 -- the one file
+                   reviewers watch. Skips a merged file that already carries
+                   narration audio rather than re-encoding it back to silence;
+                   --force rebuilds it anyway (then re-run narrate-video)
+  narrate-video <ticketId> [--force] [--script-only] [--dry-run] [--captions]
+                [--context <file>]...
+                   Rewrite that merged mp4 with a spoken voice-over, anchored to the
+                   browser_video_chapter cards on screen. Captions are written
+                   beside it as .srt and .ass but are NOT burned into the picture
+                   unless --captions is passed, because a caption box sits over the
+                   table rows that are usually the evidence.
+                   --context adds a background document (requirements, change
+                   summary) for the script writer to draw on.
+                   --dry-run prints the segment/budget table; --script-only stops
+                   after brow/videos/<ticketId>/.narration/script.json so the
+                   wording can be read before any audio is synthesised
+
+Requires node, and for everything past video-dir a full ffmpeg/ffprobe (mpdecimate,
+libx264; libass for burned captions). Narration uses uv (Piper TTS) and the
+claude CLI, falling back to a deterministic script without it.
+dev-env/install-tools.sh installs all of it.
+USAGE
+}
+
+main() {
+  local cmd="${1:-}"
+  [[ -n "$cmd" ]] || { usage; exit 2; }
+  shift || true
+
+  case "$cmd" in
+    video-dir) cmd_video_dir "${1:-}" ;;
+    video-note) cmd_video_note "$@" ;;
+    video-dedupe) cmd_video_dedupe "${1:-}" ;;
+    prune-videos) cmd_prune_videos "${1:-}" ;;
+    merge-videos) cmd_merge_videos "$@" ;;
+    narrate-video) cmd_narrate_video "$@" ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

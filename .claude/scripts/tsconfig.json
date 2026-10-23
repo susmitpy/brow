@@ -1,0 +1,23 @@
+{
+    "$comment": "These scripts run under tsx as ESM (they import each other with .ts extensions and use import.meta + top-level await), so they carry their own compiler settings.",
+    "compilerOptions": {
+        "target": "ES2022",
+        "lib": [
+            "ES2023"
+        ],
+        "module": "NodeNext",
+        "moduleResolution": "NodeNext",
+        "types": [
+            "node"
+        ],
+        "allowImportingTsExtensions": true,
+        "esModuleInterop": true,
+        "strict": true,
+        "noUncheckedIndexedAccess": false,
+        "skipLibCheck": true,
+        "noEmit": true
+    },
+    "include": [
+        "*.ts"
+    ]
+}

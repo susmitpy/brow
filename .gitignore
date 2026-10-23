@@ -1,0 +1,16 @@
+node_modules/
+__pycache__/
+
+# Generated macro catalogs (rebuilt by `pnpm install` / `pnpm skills:refresh`)
+.claude/skills/browser-macros/SKILL.md
+.claude/skills/browser-macros/LOCAL.md
+# Ticket-specific macros stay on the machine that recorded them
+.claude/skills/browser-macros/macros/local/
+
+# Local evidence: recordings capture the login screen
+brow/videos/
+# Former default recording root; kept so older local recordings stay untracked
+.brow/
+.playwright-mcp/
+
+.DS_Store

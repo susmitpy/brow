@@ -1,0 +1,16 @@
+{
+  "name": "browser-testing-kit",
+  "private": true,
+  "type": "module",
+  "description": "Playwright MCP browser-tester agent, browser macros, and the brow video evidence CLI",
+  "scripts": {
+    "macro": "tsx .claude/scripts/macro-cli.ts",
+    "skills:refresh": "tsx .claude/scripts/update-browser-macros-skill.ts",
+    "postinstall": "tsx .claude/scripts/update-browser-macros-skill.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "prettier": "^3.9.9",
+    "tsx": "^4.23.15"
+  }
+}
